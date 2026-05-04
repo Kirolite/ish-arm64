@@ -1639,6 +1639,246 @@ atomic_cas_segfault:
     gret
     write_bullshit 128, stp64_imm_fast_1
 
+/*
+ * Pre/post-indexed LDP/STP fast paths with writeback fused into the same
+ * gadget, eliminating the calc_addr + ldp + writeback / update_base triple.
+ *
+ * Param: rt | rt2<<8 | rn<<16 | offset<<24 (signed 16-bit offset)
+ *
+ * Pre-indexed:  effective addr = base + offset; base = base + offset (after access)
+ * Post-indexed: effective addr = base;          base = base + offset (after access)
+ *
+ * Pre-conditions enforced by gen.c emitter: rn != 31, rt != 31, rt2 != 31.
+ */
+
+/*
+ * Register usage notes for ldp/stp pre/post-indexed fast paths:
+ *
+ *   x22 = packed param (preserved across read_prep/write_prep — caller-saved
+ *         normally, but read_prep/write_prep don't call C unless we hit the
+ *         bullshit path. callee-saved inside the gadget body is x19-x28).
+ *   x11 = &cpu->x[0]        — clobbered by read_prep (uses x8-x10), so we
+ *         re-form `add x11, _cpu, #CPU_x0` after the prep.
+ *   x23, x25 = loaded values (callee-saved per asbestos gadget convention).
+ *   x24 = saved guest addr (used by crosspage path; do not reuse).
+ *   x26 = new base value (callee-saved); survives any C-call from bullshit path.
+ */
+
+/*
+ * SP-base variants: rn == 31 (i.e. SP). Used for function prologue/epilogue
+ * `STP X29, X30, [SP, #-N]!` and `LDP X29, X30, [SP], #N`.
+ * Param: rt | rt2<<8 | offset<<16  (offset signed 32-bit; rn implicit = SP)
+ */
+
+// LDP Xt, Xt2, [SP, #imm]! — pre-indexed, SP base
+.gadget ldp64_imm_preidx_sp
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    sbfx x10, x22, #16, #32         // signed offset
+    ldr x12, [_cpu, #CPU_sp]        // base = SP
+    add x26, x12, x10               // new SP = SP + offset
+    and x26, x26, #0xffffffffffff
+    mov _addr, x26
+    mov x24, _addr
+    read_prep 128, ldp64_imm_preidx_sp_1
+    ldr x23, [_addr]
+    ldr x25, [_addr, #8]
+    add x11, _cpu, #CPU_x0
+    and x8, x22, #0x1f
+    str x23, [x11, x8, lsl #3]
+    ubfx x8, x22, #8, #5
+    str x25, [x11, x8, lsl #3]
+    str x26, [_cpu, #CPU_sp]
+    gret
+    read_bullshit 128, ldp64_imm_preidx_sp_1
+
+// LDP Xt, Xt2, [SP], #imm — post-indexed, SP base
+.gadget ldp64_imm_postidx_sp
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    sbfx x10, x22, #16, #32
+    ldr x12, [_cpu, #CPU_sp]        // base = SP
+    and _addr, x12, #0xffffffffffff
+    mov x24, _addr
+    add x26, x12, x10               // new SP = SP + offset
+    and x26, x26, #0xffffffffffff
+    read_prep 128, ldp64_imm_postidx_sp_1
+    ldr x23, [_addr]
+    ldr x25, [_addr, #8]
+    add x11, _cpu, #CPU_x0
+    and x8, x22, #0x1f
+    str x23, [x11, x8, lsl #3]
+    ubfx x8, x22, #8, #5
+    str x25, [x11, x8, lsl #3]
+    str x26, [_cpu, #CPU_sp]
+    gret
+    read_bullshit 128, ldp64_imm_postidx_sp_1
+
+// STP Xt, Xt2, [SP, #imm]! — pre-indexed, SP base.
+// rt, rt2 may be 31 (XZR) — must zero-store in that case.
+.gadget stp64_imm_preidx_sp
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    add x11, _cpu, #CPU_x0
+    and x8, x22, #0x1f              // rt
+    cmp x8, #31
+    b.eq 1f
+    ldr x23, [x11, x8, lsl #3]
+    b 2f
+1:  mov x23, #0
+2:  ubfx x8, x22, #8, #5            // rt2
+    cmp x8, #31
+    b.eq 3f
+    ldr x25, [x11, x8, lsl #3]
+    b 4f
+3:  mov x25, #0
+4:  sbfx x10, x22, #16, #32
+    ldr x12, [_cpu, #CPU_sp]
+    add x26, x12, x10               // new SP
+    and x26, x26, #0xffffffffffff
+    mov _addr, x26
+    mov x24, _addr
+    write_prep 128, stp64_imm_preidx_sp_1
+    str x23, [_addr]
+    str x25, [_addr, #8]
+    write_done 128, stp64_imm_preidx_sp_1
+    str x26, [_cpu, #CPU_sp]
+    gret
+    write_bullshit 128, stp64_imm_preidx_sp_1
+
+// STP Xt, Xt2, [SP], #imm — post-indexed, SP base.
+.gadget stp64_imm_postidx_sp
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    add x11, _cpu, #CPU_x0
+    and x8, x22, #0x1f
+    cmp x8, #31
+    b.eq 1f
+    ldr x23, [x11, x8, lsl #3]
+    b 2f
+1:  mov x23, #0
+2:  ubfx x8, x22, #8, #5
+    cmp x8, #31
+    b.eq 3f
+    ldr x25, [x11, x8, lsl #3]
+    b 4f
+3:  mov x25, #0
+4:  sbfx x10, x22, #16, #32
+    ldr x12, [_cpu, #CPU_sp]
+    and _addr, x12, #0xffffffffffff
+    mov x24, _addr
+    add x26, x12, x10
+    and x26, x26, #0xffffffffffff
+    write_prep 128, stp64_imm_postidx_sp_1
+    str x23, [_addr]
+    str x25, [_addr, #8]
+    write_done 128, stp64_imm_postidx_sp_1
+    str x26, [_cpu, #CPU_sp]
+    gret
+    write_bullshit 128, stp64_imm_postidx_sp_1
+
+// LDP Xt, Xt2, [Xn, #imm]! — pre-indexed
+.gadget ldp64_imm_preidx_fast
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    ubfx x9, x22, #16, #5           // rn
+    sbfx x10, x22, #24, #16         // signed offset
+    add x11, _cpu, #CPU_x0
+    ldr x12, [x11, x9, lsl #3]      // base
+    add x26, x12, x10               // new base = base + offset (callee-saved)
+    and x26, x26, #0xffffffffffff
+    mov _addr, x26                  // access addr = base + offset
+    mov x24, _addr
+    read_prep 128, ldp64_imm_preidx_fast_1
+    ldr x23, [_addr]
+    ldr x25, [_addr, #8]
+    add x11, _cpu, #CPU_x0          // re-form (read_prep clobbers x8-x10)
+    and x8, x22, #0x1f              // rt
+    str x23, [x11, x8, lsl #3]
+    ubfx x8, x22, #8, #5            // rt2
+    str x25, [x11, x8, lsl #3]
+    ubfx x9, x22, #16, #5           // rn
+    str x26, [x11, x9, lsl #3]      // writeback base = base + offset
+    gret
+    read_bullshit 128, ldp64_imm_preidx_fast_1
+
+// LDP Xt, Xt2, [Xn], #imm — post-indexed
+.gadget ldp64_imm_postidx_fast
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    ubfx x9, x22, #16, #5
+    sbfx x10, x22, #24, #16
+    add x11, _cpu, #CPU_x0
+    ldr x12, [x11, x9, lsl #3]      // base = access addr
+    and _addr, x12, #0xffffffffffff
+    mov x24, _addr
+    add x26, x12, x10               // new base = base + offset (callee-saved)
+    and x26, x26, #0xffffffffffff
+    read_prep 128, ldp64_imm_postidx_fast_1
+    ldr x23, [_addr]
+    ldr x25, [_addr, #8]
+    add x11, _cpu, #CPU_x0
+    and x8, x22, #0x1f
+    str x23, [x11, x8, lsl #3]
+    ubfx x8, x22, #8, #5
+    str x25, [x11, x8, lsl #3]
+    ubfx x9, x22, #16, #5
+    str x26, [x11, x9, lsl #3]      // writeback base
+    gret
+    read_bullshit 128, ldp64_imm_postidx_fast_1
+
+// STP Xt, Xt2, [Xn, #imm]! — pre-indexed
+.gadget stp64_imm_preidx_fast
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    and x8, x22, #0x1f              // rt
+    add x11, _cpu, #CPU_x0
+    ldr x23, [x11, x8, lsl #3]      // val1
+    ubfx x8, x22, #8, #5            // rt2
+    ldr x25, [x11, x8, lsl #3]      // val2
+    ubfx x9, x22, #16, #5           // rn
+    sbfx x10, x22, #24, #16         // offset
+    ldr x12, [x11, x9, lsl #3]      // base
+    add x26, x12, x10               // new base
+    and x26, x26, #0xffffffffffff
+    mov _addr, x26
+    mov x24, _addr
+    write_prep 128, stp64_imm_preidx_fast_1
+    str x23, [_addr]
+    str x25, [_addr, #8]
+    write_done 128, stp64_imm_preidx_fast_1
+    add x11, _cpu, #CPU_x0
+    ubfx x9, x22, #16, #5
+    str x26, [x11, x9, lsl #3]      // writeback
+    gret
+    write_bullshit 128, stp64_imm_preidx_fast_1
+
+// STP Xt, Xt2, [Xn], #imm — post-indexed
+.gadget stp64_imm_postidx_fast
+    ldr x22, [_pc]
+    add _pc, _pc, #8
+    and x8, x22, #0x1f
+    add x11, _cpu, #CPU_x0
+    ldr x23, [x11, x8, lsl #3]
+    ubfx x8, x22, #8, #5
+    ldr x25, [x11, x8, lsl #3]
+    ubfx x9, x22, #16, #5
+    sbfx x10, x22, #24, #16
+    ldr x12, [x11, x9, lsl #3]      // base = access addr
+    and _addr, x12, #0xffffffffffff
+    mov x24, _addr
+    add x26, x12, x10               // new base
+    and x26, x26, #0xffffffffffff
+    write_prep 128, stp64_imm_postidx_fast_1
+    str x23, [_addr]
+    str x25, [_addr, #8]
+    write_done 128, stp64_imm_postidx_fast_1
+    add x11, _cpu, #CPU_x0
+    ubfx x9, x22, #16, #5
+    str x26, [x11, x9, lsl #3]
+    gret
+    write_bullshit 128, stp64_imm_postidx_fast_1
+
 // Fast-path LDP Wt, Wt2, [Xn, #imm] (rn!=31, rt!=31, rt2!=31)
 .gadget ldp32_imm_fast
     ldr x22, [_pc]

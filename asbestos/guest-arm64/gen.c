@@ -145,6 +145,14 @@ extern void gadget_store32_imm_signed_fast(void);
 extern void gadget_store64_imm_signed_fast(void);
 extern void gadget_load64_reg_fast(void);
 extern void gadget_load32_reg_fast(void);
+extern void gadget_ldp64_imm_preidx_fast(void);
+extern void gadget_ldp64_imm_postidx_fast(void);
+extern void gadget_stp64_imm_preidx_fast(void);
+extern void gadget_stp64_imm_postidx_fast(void);
+extern void gadget_ldp64_imm_preidx_sp(void);
+extern void gadget_ldp64_imm_postidx_sp(void);
+extern void gadget_stp64_imm_preidx_sp(void);
+extern void gadget_stp64_imm_postidx_sp(void);
 
 // Per-condition bcond gadgets
 extern void gadget_bcond_eq(void);
@@ -2527,6 +2535,45 @@ static int gen_ldst(struct gen_state *state, uint32_t insn) {
             else
                 gadget = fast_pair ? (is64 ? gadget_stp64_imm_fast : gadget_stp32_imm_fast)
                                    : (is64 ? gadget_stp64_imm : gadget_stp32_imm);
+            gen(state, (unsigned long) gadget);
+            gen(state, param);
+            return 1;
+        }
+
+        // Pre/post-indexed fast path, SP-base (rn == 31): function prologue/epilogue
+        // STP X29, X30, [SP, #-N]! and LDP X29, X30, [SP], #N. Common in nearly every
+        // guest binary; the generic 3-gadget path is the largest single hot pair on
+        // Python workloads.
+        // For LDP-postidx, ARM ARM forbids rt or rt2 == rn (SP); checks unnecessary.
+        // For STP we accept any rt/rt2 (including XZR, gadget zeros it).
+        if (is64 && rn == 31) {
+            int32_t off32 = (int32_t)offset;
+            uint64_t param = (uint64_t)(rt & 0x1f)
+                           | ((uint64_t)(rt2 & 0x1f) << 8)
+                           | (((uint64_t)(uint32_t)off32) << 16);
+            void *gadget;
+            if (L) gadget = is_pre ? gadget_ldp64_imm_preidx_sp : gadget_ldp64_imm_postidx_sp;
+            else   gadget = is_pre ? gadget_stp64_imm_preidx_sp : gadget_stp64_imm_postidx_sp;
+            gen(state, (unsigned long) gadget);
+            gen(state, param);
+            return 1;
+        }
+
+        // Pre/post-indexed fast path: rn != 31, rt != 31, rt2 != 31, 64-bit only.
+        // To preserve ARM "writeback after access" semantics for post-indexed
+        // ldp where rt or rt2 == rn (writeback overrides loaded value), we
+        // restrict the fast path to disjoint dest/base registers and let the
+        // generic 3-gadget sequence handle the overlap case.
+        if (is64 && rn != 31 && rt != 31 && rt2 != 31 &&
+            rn != rt && rn != rt2) {
+            int16_t off16 = (int16_t)offset;
+            uint64_t param = (uint64_t)(rt & 0x1f)
+                           | ((uint64_t)(rt2 & 0x1f) << 8)
+                           | ((uint64_t)(rn & 0x1f) << 16)
+                           | (((uint64_t)(uint16_t)off16) << 24);
+            void *gadget;
+            if (L) gadget = is_pre ? gadget_ldp64_imm_preidx_fast : gadget_ldp64_imm_postidx_fast;
+            else   gadget = is_pre ? gadget_stp64_imm_preidx_fast : gadget_stp64_imm_postidx_fast;
             gen(state, (unsigned long) gadget);
             gen(state, param);
             return 1;
